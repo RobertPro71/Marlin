@@ -736,17 +736,6 @@ float Temperature::get_pid_output(const int8_t e) {
  *  - Apply filament width to the extrusion rate (may move)
  *  - Update the heated bed PID output value
  */
-
-/**
- * The following line SOMETIMES results in the dreaded "unable to find a register to spill in class 'POINTER_REGS'"
- * compile error.
- *    thermal_runaway_protection(&thermal_runaway_state_machine[e], &thermal_runaway_timer[e], current_temperature[e], target_temperature[e], e, THERMAL_PROTECTION_PERIOD, THERMAL_PROTECTION_HYSTERESIS);
- *
- * This is due to a bug in the C++ compiler used by the Arduino IDE from 1.6.10 to at least 1.8.1.
- *
- * The work around is to add the compiler flag "__attribute__((__optimize__("O2")))" to the declaration for manage_heater()
- */
-//void Temperature::manage_heater()  __attribute__((__optimize__("O2")));
 void Temperature::manage_heater() {
 
   if (!temp_meas_ready) return;
@@ -801,19 +790,16 @@ void Temperature::manage_heater() {
     }
   #endif
 
-  // Control the extruder rate based on the width sensor
   #if ENABLED(FILAMENT_WIDTH_SENSOR)
+    /**
+     * Filament Width Sensor dynamically sets the volumetric multiplier
+     * based on a delayed measurement of the filament diameter.
+     */
     if (filament_sensor) {
       meas_shift_index = filwidth_delay_index[0] - meas_delay_cm;
       if (meas_shift_index < 0) meas_shift_index += MAX_MEASUREMENT_DELAY + 1;  //loop around buffer if needed
       meas_shift_index = constrain(meas_shift_index, 0, MAX_MEASUREMENT_DELAY);
-
-      // Get the delayed info and add 100 to reconstitute to a percent of
-      // the nominal filament diameter then square it to get an area
-      float vmroot = measurement_delay[meas_shift_index] * 0.01 + 1.0;
-      NOLESS(vmroot, 0.1);
-      planner.volumetric_multiplier[FILAMENT_SENSOR_EXTRUDER_NUM] = 1.0 / CIRCLE_AREA(vmroot / 2);
-      planner.refresh_e_factor(FILAMENT_SENSOR_EXTRUDER_NUM);
+      planner.calculate_volumetric_for_width_sensor(measurement_delay[meas_shift_index]);
     }
   #endif // FILAMENT_WIDTH_SENSOR
 
@@ -844,10 +830,8 @@ void Temperature::manage_heater() {
     #endif
 
     #if HEATER_IDLE_HANDLER
-      if (bed_idle_timeout_exceeded)
-      {
+      if (bed_idle_timeout_exceeded) {
         soft_pwm_amount_bed = 0;
-
         #if DISABLED(PIDTEMPBED)
           WRITE_HEATER_BED(LOW);
         #endif
@@ -857,23 +841,17 @@ void Temperature::manage_heater() {
     {
       #if ENABLED(PIDTEMPBED)
         soft_pwm_amount_bed = WITHIN(current_temperature_bed, BED_MINTEMP, BED_MAXTEMP) ? (int)get_pid_output_bed() >> 1 : 0;
-
-      #elif ENABLED(BED_LIMIT_SWITCHING)
+      #else
         // Check if temperature is within the correct band
         if (WITHIN(current_temperature_bed, BED_MINTEMP, BED_MAXTEMP)) {
-          if (current_temperature_bed >= target_temperature_bed + BED_HYSTERESIS)
-            soft_pwm_amount_bed = 0;
-          else if (current_temperature_bed <= target_temperature_bed - (BED_HYSTERESIS))
-            soft_pwm_amount_bed = MAX_BED_POWER >> 1;
-        }
-        else {
-          soft_pwm_amount_bed = 0;
-          WRITE_HEATER_BED(LOW);
-        }
-      #else // !PIDTEMPBED && !BED_LIMIT_SWITCHING
-        // Check if temperature is within the correct range
-        if (WITHIN(current_temperature_bed, BED_MINTEMP, BED_MAXTEMP)) {
-          soft_pwm_amount_bed = current_temperature_bed < target_temperature_bed ? MAX_BED_POWER >> 1 : 0;
+          #if ENABLED(BED_LIMIT_SWITCHING)
+            if (current_temperature_bed >= target_temperature_bed + BED_HYSTERESIS)
+              soft_pwm_amount_bed = 0;
+            else if (current_temperature_bed <= target_temperature_bed - (BED_HYSTERESIS))
+              soft_pwm_amount_bed = MAX_BED_POWER >> 1;
+          #else // !PIDTEMPBED && !BED_LIMIT_SWITCHING
+            soft_pwm_amount_bed = current_temperature_bed < target_temperature_bed ? MAX_BED_POWER >> 1 : 0;
+          #endif
         }
         else {
           soft_pwm_amount_bed = 0;
@@ -888,7 +866,7 @@ void Temperature::manage_heater() {
 
 // Derived from RepRap FiveD extruder::getTemperature()
 // For hot end temperature measurement.
-float Temperature::analog2temp(int raw, uint8_t e) {
+float Temperature::analog2temp(const int raw, const uint8_t e) {
   #if ENABLED(TEMP_SENSOR_1_AS_REDUNDANT)
     if (e > HOTENDS)
   #else
@@ -929,39 +907,41 @@ float Temperature::analog2temp(int raw, uint8_t e) {
   return ((raw * ((5.0 * 100.0) / 1024.0) / OVERSAMPLENR) * (TEMP_SENSOR_AD595_GAIN)) + TEMP_SENSOR_AD595_OFFSET;
 }
 
-// Derived from RepRap FiveD extruder::getTemperature()
-// For bed temperature measurement.
-float Temperature::analog2tempBed(const int raw) {
-  #if ENABLED(BED_USES_THERMISTOR)
-    float celsius = 0;
-    byte i;
+#if HAS_TEMP_BED
+  // Derived from RepRap FiveD extruder::getTemperature()
+  // For bed temperature measurement.
+  float Temperature::analog2tempBed(const int raw) {
+    #if ENABLED(BED_USES_THERMISTOR)
+      float celsius = 0;
+      byte i;
 
-    for (i = 1; i < BEDTEMPTABLE_LEN; i++) {
-      if (PGM_RD_W(BEDTEMPTABLE[i][0]) > raw) {
-        celsius  = PGM_RD_W(BEDTEMPTABLE[i - 1][1]) +
-                   (raw - PGM_RD_W(BEDTEMPTABLE[i - 1][0])) *
-                   (float)(PGM_RD_W(BEDTEMPTABLE[i][1]) - PGM_RD_W(BEDTEMPTABLE[i - 1][1])) /
-                   (float)(PGM_RD_W(BEDTEMPTABLE[i][0]) - PGM_RD_W(BEDTEMPTABLE[i - 1][0]));
-        break;
+      for (i = 1; i < BEDTEMPTABLE_LEN; i++) {
+        if (PGM_RD_W(BEDTEMPTABLE[i][0]) > raw) {
+          celsius  = PGM_RD_W(BEDTEMPTABLE[i - 1][1]) +
+                     (raw - PGM_RD_W(BEDTEMPTABLE[i - 1][0])) *
+                     (float)(PGM_RD_W(BEDTEMPTABLE[i][1]) - PGM_RD_W(BEDTEMPTABLE[i - 1][1])) /
+                     (float)(PGM_RD_W(BEDTEMPTABLE[i][0]) - PGM_RD_W(BEDTEMPTABLE[i - 1][0]));
+          break;
+        }
       }
-    }
 
-    // Overflow: Set to last value in the table
-    if (i == BEDTEMPTABLE_LEN) celsius = PGM_RD_W(BEDTEMPTABLE[i - 1][1]);
+      // Overflow: Set to last value in the table
+      if (i == BEDTEMPTABLE_LEN) celsius = PGM_RD_W(BEDTEMPTABLE[i - 1][1]);
 
-    return celsius;
+      return celsius;
 
-  #elif defined(BED_USES_AD595)
+    #elif defined(BED_USES_AD595)
 
-    return ((raw * ((5.0 * 100.0) / 1024.0) / OVERSAMPLENR) * (TEMP_SENSOR_AD595_GAIN)) + TEMP_SENSOR_AD595_OFFSET;
+      return ((raw * ((5.0 * 100.0) / 1024.0) / OVERSAMPLENR) * (TEMP_SENSOR_AD595_GAIN)) + TEMP_SENSOR_AD595_OFFSET;
 
-  #else
+    #else
 
-    UNUSED(raw);
-    return 0;
+      UNUSED(raw);
+      return 0;
 
-  #endif
-}
+    #endif
+  }
+#endif // HAS_TEMP_BED
 
 /**
  * Get the raw values into the actual temperatures.
@@ -975,7 +955,9 @@ void Temperature::updateTemperaturesFromRawValues() {
   #endif
   HOTEND_LOOP()
     current_temperature[e] = Temperature::analog2temp(current_temperature_raw[e], e);
-  current_temperature_bed = Temperature::analog2tempBed(current_temperature_bed_raw);
+  #if HAS_TEMP_BED
+    current_temperature_bed = Temperature::analog2tempBed(current_temperature_bed_raw);
+  #endif
   #if ENABLED(TEMP_SENSOR_1_AS_REDUNDANT)
     redundant_temperature = Temperature::analog2temp(redundant_temperature_raw, 1);
   #endif
@@ -999,15 +981,20 @@ void Temperature::updateTemperaturesFromRawValues() {
   // Convert raw Filament Width to millimeters
   float Temperature::analog2widthFil() {
     return current_raw_filwidth * 5.0 * (1.0 / 16383.0);
-    //return current_raw_filwidth;
   }
 
-  // Convert raw Filament Width to a ratio
-  int Temperature::widthFil_to_size_ratio() {
-    float temp = filament_width_meas;
-    if (temp < MEASURED_LOWER_LIMIT) temp = filament_width_nominal;  //assume sensor cut out
-    else NOMORE(temp, MEASURED_UPPER_LIMIT);
-    return filament_width_nominal / temp * 100;
+  /**
+   * Convert Filament Width (mm) to a simple ratio
+   * and reduce to an 8 bit value.
+   *
+   * A nominal width of 1.75 and measured width of 1.73
+   * gives (100 * 1.75 / 1.73) for a ratio of 101 and
+   * a return value of 1.
+   */
+  int8_t Temperature::widthFil_to_size_ratio() {
+    if (FABS(filament_width_nominal - filament_width_meas) <= FILWIDTH_ERROR_MARGIN)
+      return int(100.0 * filament_width_nominal / filament_width_meas) - 100;
+    return 0;
   }
 
 #endif
@@ -1243,24 +1230,26 @@ void Temperature::init() {
     #endif // HOTENDS > 2
   #endif // HOTENDS > 1
 
-  #ifdef BED_MINTEMP
-    while (analog2tempBed(bed_minttemp_raw) < BED_MINTEMP) {
-      #if HEATER_BED_RAW_LO_TEMP < HEATER_BED_RAW_HI_TEMP
-        bed_minttemp_raw += OVERSAMPLENR;
-      #else
-        bed_minttemp_raw -= OVERSAMPLENR;
-      #endif
-    }
-  #endif // BED_MINTEMP
-  #ifdef BED_MAXTEMP
-    while (analog2tempBed(bed_maxttemp_raw) > BED_MAXTEMP) {
-      #if HEATER_BED_RAW_LO_TEMP < HEATER_BED_RAW_HI_TEMP
-        bed_maxttemp_raw -= OVERSAMPLENR;
-      #else
-        bed_maxttemp_raw += OVERSAMPLENR;
-      #endif
-    }
-  #endif // BED_MAXTEMP
+  #if HAS_TEMP_BED
+    #ifdef BED_MINTEMP
+      while (analog2tempBed(bed_minttemp_raw) < BED_MINTEMP) {
+        #if HEATER_BED_RAW_LO_TEMP < HEATER_BED_RAW_HI_TEMP
+          bed_minttemp_raw += OVERSAMPLENR;
+        #else
+          bed_minttemp_raw -= OVERSAMPLENR;
+        #endif
+      }
+    #endif // BED_MINTEMP
+    #ifdef BED_MAXTEMP
+      while (analog2tempBed(bed_maxttemp_raw) > BED_MAXTEMP) {
+        #if HEATER_BED_RAW_LO_TEMP < HEATER_BED_RAW_HI_TEMP
+          bed_maxttemp_raw -= OVERSAMPLENR;
+        #else
+          bed_maxttemp_raw += OVERSAMPLENR;
+        #endif
+      }
+    #endif // BED_MAXTEMP
+  #endif // HAS_TEMP_BED
 
   #if ENABLED(PROBING_HEATERS_OFF)
     paused = false;
@@ -1314,7 +1303,7 @@ void Temperature::init() {
     millis_t Temperature::thermal_runaway_bed_timer;
   #endif
 
-  void Temperature::thermal_runaway_protection(Temperature::TRState * const state, millis_t * const timer, const float current, const float target, const int8_t heater_id, const uint16_t period_seconds, const uint16_t hysteresis_degc) {
+  void Temperature::thermal_runaway_protection(Temperature::TRState * const state, millis_t * const timer, const float &current, const float &target, const int8_t heater_id, const uint16_t period_seconds, const uint16_t hysteresis_degc) {
 
     static float tr_target_temperature[HOTENDS + 1] = { 0.0 };
 
@@ -1337,22 +1326,22 @@ void Temperature::init() {
 
     #if HEATER_IDLE_HANDLER
       // If the heater idle timeout expires, restart
-      if (heater_id >= 0 && heater_idle_timeout_exceeded[heater_id]) {
+      if ((heater_id >= 0 && heater_idle_timeout_exceeded[heater_id])
+        #if HAS_TEMP_BED
+          || (heater_id < 0 && bed_idle_timeout_exceeded)
+        #endif
+      ) {
         *state = TRInactive;
         tr_target_temperature[heater_index] = 0;
       }
-      #if HAS_TEMP_BED
-        else if (heater_id < 0 && bed_idle_timeout_exceeded) {
-          *state = TRInactive;
-          tr_target_temperature[heater_index] = 0;
-        }
-      #endif
       else
     #endif
-    // If the target temperature changes, restart
-    if (tr_target_temperature[heater_index] != target) {
-      tr_target_temperature[heater_index] = target;
-      *state = target > 0 ? TRFirstHeating : TRInactive;
+    {
+      // If the target temperature changes, restart
+      if (tr_target_temperature[heater_index] != target) {
+        tr_target_temperature[heater_index] = target;
+        *state = target > 0 ? TRFirstHeating : TRInactive;
+      }
     }
 
     switch (*state) {
